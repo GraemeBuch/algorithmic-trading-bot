@@ -1,5 +1,6 @@
 # Data files - too large for git
 data/
+bitget/
 
 # ML model files
 *.cbm
