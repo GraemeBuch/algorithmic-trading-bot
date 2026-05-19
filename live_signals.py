@@ -17,6 +17,7 @@ import os
 import time
 import json
 import pathlib
+import requests
 from pathlib import Path
 import datetime
 import numpy as np
@@ -324,6 +325,44 @@ def fetch_ohlcv(exchange, symbol: str, tf: str, limit: int) -> pd.DataFrame:
 
     df = pd.DataFrame(unique, columns=["time", "open", "high", "low", "close", "volume"])
     df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True).dt.tz_localize(None)
+    return df.set_index("time").astype(float)
+
+
+def fetch_binance_bars(symbol: str, tf: str, limit: int) -> pd.DataFrame:
+    """Fetch OHLCV bars from Binance public REST API (no auth needed).
+    Used for signal detection so bar data matches the training corpus.
+    Trade execution stays on Bitget.
+    """
+    bn_sym = symbol.replace("/", "").split(":")[0]  # "BTC/USDT" -> "BTCUSDT"
+    bars: list = []
+    end_ms: int | None = None
+    remaining = limit
+    while remaining > 0:
+        n = min(remaining, 1000)
+        url = (f"https://api.binance.com/api/v3/klines"
+               f"?symbol={bn_sym}&interval={tf}&limit={n}"
+               + (f"&endTime={end_ms}" if end_ms else ""))
+        try:
+            r = requests.get(url, timeout=20)
+            r.raise_for_status()
+            chunk = r.json()
+        except Exception as exc:
+            print(f"  Binance fetch error ({bn_sym} {tf}): {exc} — retrying")
+            time.sleep(5)
+            continue
+        if not chunk:
+            break
+        bars = chunk + bars
+        end_ms = int(chunk[0][0]) - 1
+        remaining -= len(chunk)
+        if len(chunk) < n:
+            break
+        time.sleep(0.1)
+    df = pd.DataFrame(bars, columns=["time", "open", "high", "low", "close", "volume",
+                                      "ct", "qv", "n", "tbbv", "tbqv", "ig"])
+    df = df[["time", "open", "high", "low", "close", "volume"]].copy()
+    df["time"] = pd.to_datetime(df["time"].astype("int64"), unit="ms")
+    df = df.drop_duplicates("time").sort_values("time").tail(limit)
     return df.set_index("time").astype(float)
 
 
@@ -932,7 +971,7 @@ def scan_symbol(
     btc_trend: pd.Series,
     sym_state: dict,
 ) -> dict:
-    df1h_raw = fetch_ohlcv(exchange, symbol, "1h", LOOKBACK_1H)
+    df1h_raw = fetch_binance_bars(symbol, "1h", LOOKBACK_1H)
     # Grab live intrabar high/low before dropping the forming bar.
     # Used only for pending-setup activation so we enter the moment price
     # touches the entry level — not an hour later at bar close.
@@ -940,7 +979,7 @@ def scan_symbol(
     live_hi    = float(df1h_raw["high"].iloc[-1])
     live_lo    = float(df1h_raw["low"].iloc[-1])
     df1h = df1h_raw.iloc[:-1]
-    df4h = fetch_ohlcv(exchange, symbol, "4h", LOOKBACK_4H).iloc[:-1]
+    df4h = fetch_binance_bars(symbol, "4h", LOOKBACK_4H).iloc[:-1]
 
     df1h["atr"]       = true_range(df1h).rolling(ATR_LEN).mean()
     df1h["atr_pct"]   = df1h["atr"] / df1h["close"]
@@ -1461,7 +1500,7 @@ def main():
                 continue
 
             # New bar — now fetch full data
-            b4h              = fetch_ohlcv(exchange, SYMBOL_BTC, "4h", LOOKBACK_4H).iloc[:-1]
+            b4h              = fetch_binance_bars(SYMBOL_BTC, "4h", LOOKBACK_4H).iloc[:-1]
             btc_trend        = calc_htf_trend(b4h)
             cached_btc_trend = btc_trend
 

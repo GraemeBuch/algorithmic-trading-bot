@@ -69,10 +69,6 @@ def run_backtest_signals(symbol, csv_1h, csv_1m, btc_df, start_dt, end_dt):
         print(f"  {symbol}: 1m data is {data_age} days old — skipping")
         return None
 
-    # Trim 1H to 120 days for speed
-    cutoff_1h = df_1h.index.max() - timedelta(days=120)
-    df_1h = df_1h[df_1h.index >= cutoff_1h].copy()
-
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         try:

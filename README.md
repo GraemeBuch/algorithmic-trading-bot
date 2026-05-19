@@ -152,22 +152,41 @@ After retraining, deploy with the full deploy sequence above (code + models + CS
 
 | What | Value | Why |
 |------|-------|-----|
-| LOOKBACK_1H | 2000 bars (~83 days) | Matches level history used in backtest |
+| LOOKBACK_1H | 990 bars (~41 days) | Fits single Bitget API page; startup cache provides full-history levels |
 | Entry | Limit order, 2-min timeout | Avoids market order slippage |
 | BE stop | Exact entry price | No buffer — matches backtest definition |
 | ML threshold | P ≥ 0.50 | Walk-forward validated |
 | MAX_CONCURRENT | 5 | Portfolio risk cap |
 | Startup cache | Full 7-year CSV | Eliminates feature skew vs backtest |
+| Signal bar source | Binance public API | Matches training data — avoids Bitget/Binance candle divergence |
 
 ### Live vs backtest alignment
 
-The bot and backtest now use the same feature calculation logic. Remaining differences:
+The bot and backtest use the same data source (Binance) and the same feature calculation logic.
 
-- **Data source**: live bot fetches recent bars from Bitget API; CSV data may lag by hours
-- **Startup cache staleness**: CSV data on server reflects the date of last deploy
-- **1H vs 1-min timing**: backtest resolves outcomes to the minute; live bot uses 1H close prices for entry timing
+**Key fix (May 2026):** The live bot was previously fetching 1H signal bars from the Bitget API. Bitget and Binance produce slightly different OHLCV values for the same hour — different enough that different candles qualified as engulfing, generating signals the backtest never saw. Comparison showed 0/41 live trades matched backtest signals over a 5-day window. The fix was to fetch signal bars from Binance's public REST API (no auth needed), matching the training data exactly. Trade execution remains on Bitget.
 
-These are expected and small. The major historical divergence (short Highlander lookback + market order fills) has been fixed.
+The full data pipeline is now end-to-end Binance:
+- **Startup cache (Highlander levels)** → Binance CSV (via `update_data.py`)
+- **Signal detection bars (1H + 4H)** → Binance public API
+- **BTC trend bars (4H)** → Binance public API
+- **Trade execution** → Bitget API
+
+Remaining minor differences:
+- **Startup cache staleness**: CSV data on server reflects the date of last deploy — update and redeploy periodically
+- **1H vs 1-min timing**: backtest resolves outcomes to the minute; live bot uses 1H bar data for TP/stop monitoring
+
+---
+
+## Utility Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `update_data.py` | Append missing bars to all 14 symbol CSVs (1H + 1m) from Binance |
+| `compare_live_backtest.py` | Compare live trade journal against backtest signals for the same period |
+| `validate_features.py` | Verify all 54 ML features match between live bot and backtest pipeline |
+| `recent_stats.py` | Quick last-30-day OOS check using saved models (~5-15 min) |
+| `multi_1min_backtest.py` | Full walk-forward retrain for all 14 symbols (2-4 hours) |
 
 ---
 
@@ -196,6 +215,6 @@ Last 30-day live OOS (Apr 13 – May 13 2026): **88% win / 12% BE / 0% stop, +29
 
 ## Known Issues / Pending
 
-- **SOL 1-min data** (`solusdt_1m_bitget.csv`) ends October 2025 — needs updating before next retrain
 - **AVAX**: removed from live symbols (no 1-min data, performing poorly)
 - Run `python recent_stats.py` every few weeks to check OOS performance hasn't degraded
+- Retrain models every 3-6 months to keep up with evolving market structure
