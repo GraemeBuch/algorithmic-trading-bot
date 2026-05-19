@@ -130,6 +130,27 @@ ssh root@178.104.81.50 "pgrep -a python3 | grep live_signals"
 ssh root@178.104.81.50 "tail -50 /root/bot/bot.log"
 ```
 
+### Keeping the startup cache fresh
+
+The bot pre-computes Highlander support/resistance levels from the 1H CSVs at startup. New levels form over time, so the CSVs need periodic updates.
+
+**Every 2-4 weeks — update CSVs and redeploy:**
+```bash
+# Update all 14 symbol CSVs locally
+python update_data.py
+
+# Push updated CSVs to server and restart (rebuilds startup cache)
+scp data/*_1h.csv root@178.104.81.50:/root/bot/data/
+ssh root@178.104.81.50 "pkill -f live_signals.py; sleep 2 && cd /root/bot && nohup python3 -u live_signals.py >> bot.log 2>&1 &"
+ssh root@178.104.81.50 "sleep 10 && tail -30 /root/bot/bot.log"
+```
+
+**Every 3-6 months — full retrain** (new models + updated CSVs + redeploy):
+```bash
+python multi_1min_backtest.py  # 2-4 hours
+# Then follow full deploy sequence above
+```
+
 ---
 
 ## Retraining Models
