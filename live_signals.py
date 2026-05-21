@@ -185,6 +185,7 @@ class ActiveTrade:
     btc:            str
     be_hit:         bool          = False
     be_sl_set:      bool          = False  # True once SL has been successfully moved to entry
+    be_hit_time:    Optional[pd.Timestamp] = None  # timestamp of 1m bar that triggered BE
     sl_move_attempts: int         = 0      # give up after 3 failed attempts
     live_activated: bool          = False  # activated via forming bar — skip outcome check on same bar
     activation_bar: Optional[pd.Timestamp] = None  # ts_forming at activation — skip until this bar closes
@@ -893,7 +894,7 @@ def _wh_signal_embed(t: ActiveTrade) -> dict:
                 (t.direction == "Long" and t.htf == "Bullish") or
                 (t.direction == "Short" and t.htf == "Bearish")) else "❌ No",                          "inline": True},
         ],
-        "footer": {"text": f"Engulfing: {t.eng_time}  |  Activated: {t.activated_time}"},
+        "footer": {"text": f"Engulfing: {t.eng_time} UTC  |  Activated: {t.activated_time} UTC"},
     }
 
 
@@ -911,7 +912,7 @@ def _wh_closed_embed(c: ClosedTrade) -> dict:
             {"name": "Exit level", "value": f"`{c.f2618:.5f}`" if won else f"`{c.stop:.5f}`", "inline": True},
             {"name": "P&L",        "value": f"`{c.pnl_r:+.2f}R`",                 "inline": True},
         ],
-        "footer": {"text": f"Activated: {c.activated_time}  |  Closed: {c.closed_time}"},
+        "footer": {"text": f"Activated: {c.activated_time} UTC  |  Closed: {c.closed_time} UTC"},
     }
 
 
@@ -928,7 +929,7 @@ def _wh_reminder_embed(t: ActiveTrade, remaining: int) -> dict:
             {"name": "BE level",    "value": f"`{t.f1618:.5f}`",  "inline": True},
             {"name": "P(win)",      "value": f"`{t.p_win:.3f}`",  "inline": True},
         ],
-        "footer": {"text": f"Activated: {t.activated_time}  |  Move SL to entry once {t.f1618:.5f} is touched"},
+        "footer": {"text": f"Activated: {t.activated_time} UTC  |  Move SL to entry once {t.f1618:.5f} is touched"},
     }
 
 
@@ -980,6 +981,18 @@ def scan_symbol(
     live_lo    = float(df1h_raw["low"].iloc[-1])
     df1h = df1h_raw.iloc[:-1]
     df4h = fetch_binance_bars(symbol, "4h", LOOKBACK_4H).iloc[:-1]
+
+    # Fetch recent 1m bars for active trade monitoring.
+    # Using closed 1m bars avoids the forming 1H bar accumulation problem
+    # (1H high/low grows throughout the hour — a wick to f1618 at minute 5
+    # keeps live_hi above f1618 for the remaining 55 minutes).
+    df1m_mon = None
+    if sym_state.get("active_trades"):
+        try:
+            df1m_raw = fetch_binance_bars(symbol, "1m", 5)
+            df1m_mon = df1m_raw.iloc[:-1]  # drop forming 1m bar
+        except Exception:
+            pass
 
     df1h["atr"]       = true_range(df1h).rolling(ATR_LEN).mean()
     df1h["atr_pct"]   = df1h["atr"] / df1h["close"]
@@ -1056,22 +1069,28 @@ def scan_symbol(
     for trade in active_trades:
         is_long = (trade.direction == "Long")
 
-        # Guard all level checks against the activation bar.
-        # Any touch of 1.618, 2.618, or stop that occurred on the activation
-        # candle BEFORE entry was hit must not affect the new trade.
-        closed_be_valid = (trade.activation_bar is None or ts          > trade.activation_bar)
-        live_be_valid   = (trade.activation_bar is None or ts_forming  > trade.activation_bar)
-        # Don't use live_activated for BE — the activation bar's extremes include
-        # pre-activation price action (e.g. a short activates via pullback UP to entry,
-        # but the bar's low was already below f1618 from the prior downswing).
-        if not trade.be_hit:
-            if (is_long  and ((closed_be_valid and hi_cur >= trade.f1618) or (live_be_valid and live_hi >= trade.f1618))) or \
-               (not is_long and ((closed_be_valid and lo_cur <= trade.f1618) or (live_be_valid and live_lo <= trade.f1618))):
-                trade.be_hit = True
+        # 1m bar monitoring only — never use 1H bar hi/lo for trade outcome checks.
+        # The 1H bar can't tell order of events within the bar, causing false
+        # triggers. 1m bars polled every 60s are sufficient and match the backtest.
+        act_end = (trade.activation_bar + pd.Timedelta(hours=1)
+                   if trade.activation_bar is not None else pd.Timestamp.min)
+        valid_1m = (
+            df1m_mon[df1m_mon.index > act_end]
+            if (df1m_mon is not None and len(df1m_mon) > 0)
+            else pd.DataFrame()
+        )
+        m_hi = float(valid_1m["high"].max()) if len(valid_1m) > 0 else None
+        m_lo = float(valid_1m["low"].min())  if len(valid_1m) > 0 else None
 
-        # Trade activated on the live (forming) bar — skip TP/stop checks until
-        # that forming bar has fully closed (OHLC includes pre-trade price action).
-        # activation_bar holds ts_forming at activation time.
+        was_be_hit = trade.be_hit
+        if not trade.be_hit:
+            if m_hi is not None and ((is_long and m_hi >= trade.f1618) or (not is_long and m_lo <= trade.f1618)):
+                trade.be_hit = True
+                trade.be_hit_time = valid_1m.index[-1]
+
+        be_just_triggered = not was_be_hit and trade.be_hit
+
+        # Skip the activation bar — its H/L includes pre-activation price action.
         if trade.live_activated:
             if trade.activation_bar is not None and ts <= trade.activation_bar:
                 still_active.append(trade)
@@ -1079,10 +1098,26 @@ def scan_symbol(
             trade.live_activated = False
 
         cur_stop = trade.entry if trade.be_hit else trade.stop
-        stopped  = (is_long  and ((closed_be_valid and lo_cur <= cur_stop)    or live_lo <= cur_stop)) or \
-                   (not is_long and ((closed_be_valid and hi_cur >= cur_stop)  or live_hi >= cur_stop))
-        won      = (is_long  and ((closed_be_valid and hi_cur >= trade.f2618) or live_hi >= trade.f2618)) or \
-                   (not is_long and ((closed_be_valid and lo_cur <= trade.f2618) or live_lo <= trade.f2618))
+
+        # After BE: only use 1m bars that closed AFTER the BE-triggering bar.
+        # The bar that touched f1618 may also wick to entry in the same minute.
+        if trade.be_hit and trade.be_hit_time is not None and len(valid_1m) > 0:
+            post_be  = valid_1m[valid_1m.index > trade.be_hit_time]
+            m_hi_chk = float(post_be["high"].max()) if len(post_be) > 0 else None
+            m_lo_chk = float(post_be["low"].min())  if len(post_be) > 0 else None
+        else:
+            m_hi_chk = m_hi
+            m_lo_chk = m_lo
+
+        if be_just_triggered:
+            # Skip stop check this cycle — Bitget's SL order handles it if
+            # price is genuinely at entry.
+            stopped = won = False
+        else:
+            stopped = (is_long  and m_lo_chk is not None and m_lo_chk <= cur_stop) or \
+                      (not is_long and m_hi_chk is not None and m_hi_chk >= cur_stop)
+            won     = (is_long  and m_hi_chk is not None and m_hi_chk >= trade.f2618) or \
+                      (not is_long and m_lo_chk is not None and m_lo_chk <= trade.f2618)
 
         if won:
             pnl = abs(trade.f2618 - trade.entry) / trade.risk
@@ -1382,6 +1417,7 @@ def _trade_to_dict(t: ActiveTrade) -> dict:
         "symbol": t.symbol, "direction": t.direction,
         "entry": t.entry, "stop": t.stop, "f1618": t.f1618, "f2618": t.f2618,
         "risk": t.risk, "p_win": t.p_win, "be_hit": t.be_hit, "be_sl_set": t.be_sl_set,
+        "be_hit_time": _ts(t.be_hit_time) if t.be_hit_time is not None else None,
         "sl_move_attempts": t.sl_move_attempts,
         "live_activated": t.live_activated,
         "eng_time": _ts(t.eng_time), "activated_time": _ts(t.activated_time),
