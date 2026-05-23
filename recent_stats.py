@@ -126,7 +126,12 @@ def process_symbol(symbol, csv_1h, csv_1m, btc_df):
 
 
 if __name__ == "__main__":
-    btc_df = pd.read_csv(DATA / "btc_4h.csv", parse_dates=["time"]).set_index("time").astype(float)
+    # Derive BTC 4H from the 1H CSV (kept current) rather than the stale btc_4h.csv
+    _btc_1h = pd.read_csv(DATA / "btcusdt_1h.csv", index_col=0, parse_dates=True).astype(float)
+    btc_df = (_btc_1h[["open","high","low","close","volume"]]
+              .resample("4h", label="left")
+              .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+              .dropna())
 
     all_parts = []
     for symbol, csv_1h, csv_1m in SYMBOLS:
