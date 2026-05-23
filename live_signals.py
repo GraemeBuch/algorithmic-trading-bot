@@ -382,13 +382,13 @@ def lookup(series: pd.Series, ts: pd.Timestamp) -> int:
 
 
 def precompute_startup_levels() -> None:
-    """Load full 1H CSVs and run run_indicator once per symbol at bot startup.
-    Caches levels + timestamp arrays so scan_symbol can use full history for
-    Highlander-based ML features — matching the data the model was trained on.
-    Takes ~2-3 minutes for 14 symbols; runs once only.
+    """Load 1H CSVs (trimmed to 120 days) and run run_indicator once per symbol at startup.
+    Uses the same 120-day window as the backtest so live level-proximity features
+    match backtest features exactly — preventing the live bot taking 3x more signals.
+    Takes ~10-20s for 14 symbols; runs once only.
     """
     global _startup_cache
-    print("\nPre-computing Highlander levels from full 1H history …")
+    print("\nPre-computing Highlander levels from 120-day 1H history …")
     for symbol, csv_path in CSV_1H_PATHS.items():
         p = Path(csv_path)
         if not p.exists():
@@ -397,6 +397,8 @@ def precompute_startup_levels() -> None:
         try:
             df = pd.read_csv(p, index_col=0, parse_dates=True).astype(float)
             df.index.name = "time"
+            cutoff = df.index.max() - pd.Timedelta(days=120)
+            df = df[df.index >= cutoff].copy()
             tick1 = max(float(df["close"].iloc[-1]) * 1e-5, 1e-6)
             lvl1, _ = run_indicator(df[["open","high","low","close"]],
                                     min_range_ticks=3.0, tick_size=tick1)
