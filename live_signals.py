@@ -1072,9 +1072,11 @@ def scan_symbol(
         is_long = (trade.direction == "Long")
 
         # 1m bar monitoring only — never use 1H bar hi/lo for trade outcome checks.
-        # The 1H bar can't tell order of events within the bar, causing false
-        # triggers. 1m bars polled every 60s are sufficient and match the backtest.
-        act_end = (trade.activation_bar + pd.Timedelta(hours=1)
+        # Skip only bars at or before the activation bar open — bars from
+        # activation_bar+1min onwards are valid post-activation 1m data.
+        # (Previously skipped the full activation hour, missing trades that
+        # close within the first hour such as fast BE+stop sequences.)
+        act_end = (trade.activation_bar
                    if trade.activation_bar is not None else pd.Timestamp.min)
         valid_1m = (
             df1m_mon[df1m_mon.index > act_end]
