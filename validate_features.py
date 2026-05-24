@@ -184,14 +184,20 @@ def compute_live_features(row, df_1h, btc_df):
     htf_aligned = int((direction == "Long" and htf_now == "Bullish") or
                       (direction == "Short" and htf_now == "Bearish"))
 
-    # Highlander levels (full history — same as startup cache)
-    tick = max(float(df_1h["close"].iloc[-1]) * 1e-5, 1e-6)
-    levels_1h, _ = run_indicator(df_1h[["open","high","low","close"]], min_range_ticks=3.0, tick_size=tick)
-    tick4 = max(float(df_4h["close"].iloc[-1]) * 1e-5, 1e-6)
-    levels_4h, _ = run_indicator(df_4h[["open","high","low","close"]], min_range_ticks=3.0, tick_size=tick4)
+    # Highlander levels — 120-day trim, matching startup cache
+    cutoff_120 = df_1h.index.max() - pd.Timedelta(days=120)
+    df_1h_trim = df_1h[df_1h.index >= cutoff_120].copy()
+    df_4h_trim = (df_1h_trim[["open","high","low","close","volume"]]
+                  .resample("4h", label="left")
+                  .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+                  .dropna())
+    tick = max(float(df_1h_trim["close"].iloc[-1]) * 1e-5, 1e-6)
+    levels_1h, _ = run_indicator(df_1h_trim[["open","high","low","close"]], min_range_ticks=3.0, tick_size=tick)
+    tick4 = max(float(df_4h_trim["close"].iloc[-1]) * 1e-5, 1e-6)
+    levels_4h, _ = run_indicator(df_4h_trim[["open","high","low","close"]], min_range_ticks=3.0, tick_size=tick4)
 
-    ts_1h = df_1h.index.to_numpy().astype("int64")
-    ts_4h = df_4h.index.to_numpy().astype("int64")
+    ts_1h = df_1h_trim.index.to_numpy().astype("int64")
+    ts_4h = df_4h_trim.index.to_numpy().astype("int64")
 
     def cache_bar(ts, ts_arr):
         idx = int(np.searchsorted(ts_arr, np.int64(ts.value), side="right")) - 1
@@ -278,7 +284,11 @@ def compare_features(bt_row, live_feat):
 
 
 if __name__ == "__main__":
-    btc_df = pd.read_csv(DATA / "btc_4h.csv", parse_dates=["time"]).set_index("time").astype(float)
+    _btc_1h = pd.read_csv(DATA / "btcusdt_1h.csv", index_col=0, parse_dates=True).astype(float)
+    btc_df = (_btc_1h[["open","high","low","close","volume"]]
+              .resample("4h", label="left")
+              .agg({"open":"first","high":"max","low":"min","close":"last","volume":"sum"})
+              .dropna())
 
     total_signals = 0
     total_diffs   = 0
@@ -325,10 +335,18 @@ if __name__ == "__main__":
         if "vol_ratio" in ds.columns:
             ds["vol_ratio"] = ds["vol_ratio"].fillna(1.0)
 
-        print(f"\n{symbol}  ({len(ds)} signals in last 60 days)")
+        # Filter to last 30 days — same window as recent_stats.py
+        ds["act_dt"] = pd.to_datetime(ds["activation_time"])
+        cutoff = ds["act_dt"].max() - pd.Timedelta(days=30)
+        recent = ds[ds["act_dt"] >= cutoff].copy()
+        print(f"\n{symbol}  ({len(recent)} signals in last 30 days)")
 
-        # Take up to 3 signals to check
-        for _, row in ds.head(3).iterrows():
+        if recent.empty:
+            print(f"  no recent signals")
+            continue
+
+        # Take up to 5 most recent signals
+        for _, row in recent.tail(5).iterrows():
             total_signals += 1
             try:
                 live_feat = compute_live_features(row, df_1h, btc_df)

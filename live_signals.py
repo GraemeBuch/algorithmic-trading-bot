@@ -41,8 +41,8 @@ SYMBOL_BTC      = "BTC/USDT"
 P_THRESHOLD     = 0.50
 ATR_LEN         = 14
 MAX_BARS_TO_ACT = 50
-LOOKBACK_1H     = 990    # ~41 days of 1H bars; startup cache provides full-history levels separately
-LOOKBACK_4H     = 200
+LOOKBACK_1H     = 2880   # 120 days of 1H bars — matches backtest window for level computation
+LOOKBACK_4H     = 720    # 120 days of 4H bars — matches backtest window
 MAX_CLOSED_HIST = 20
 MAX_CANCEL_HIST   = 10
 MAX_FILTERED_HIST = 20
@@ -76,8 +76,7 @@ SYMBOLS = {
     "NEAR/USDT": "data/catboost_clf_nearusdt_1h.cbm",
 }
 
-# Full 1H CSV paths — used at startup to pre-compute Highlander levels from full history,
-# matching the data the ML model was trained on.
+# Full 1H CSV paths — kept for reference; levels are now computed live from Binance API.
 CSV_1H_PATHS = {
     "BTC/USDT":  "data/btcusdt_1h.csv",
     "ETH/USDT":  "data/ethusdt_1h.csv",
@@ -95,8 +94,8 @@ CSV_1H_PATHS = {
     "NEAR/USDT": "data/nearusdt_1h.csv",
 }
 
-# Startup level cache — populated once at bot launch, used in every scan_symbol call.
-_startup_cache: dict = {}   # symbol -> {levels_1h, ts_1h, levels_4h, ts_4h}
+# Level cache — no longer used; levels are now computed fresh every 1H bar in scan_symbol.
+_startup_cache: dict = {}
 
 CAT_FEATURES = ["direction", "session", "htf_trend", "btc_trend", "day"]
 NUM_FEATURES = [
@@ -1208,19 +1207,10 @@ def scan_symbol(
             i_4h   = max(0, int(np.searchsorted(df4h_idx, t.to_numpy(), side="right")) - 1)
             i_4h   = min(i_4h, len(df4h) - 1)
             atr_4h = float(df4h_atr[i_4h]) if np.isfinite(df4h_atr[i_4h]) else atr_v
-            _sc = _startup_cache.get(symbol)
-            if _sc:
-                _ei1 = _cache_bar(t, _sc["ts_1h"])
-                _ei4 = _cache_bar(t, _sc["ts_4h"])
-                lf1h      = get_entry_level_feat(entry,  is_bull, atr_v,  _sc["levels_1h"], _ei1, "entry_1h")
-                lf4h      = get_entry_level_feat(entry,  is_bull, atr_4h, _sc["levels_4h"], _ei4, "entry_4h")
-                lf_orig1h = get_entry_level_feat(origin, is_bull, atr_v,  _sc["levels_1h"], _ei1, "origin_1h")
-                lf_orig4h = get_entry_level_feat(origin, is_bull, atr_4h, _sc["levels_4h"], _ei4, "origin_4h")
-            else:
-                lf1h      = get_entry_level_feat(entry,  is_bull, atr_v,  levels,    i,    "entry_1h")
-                lf4h      = get_entry_level_feat(entry,  is_bull, atr_4h, levels_4h, i_4h, "entry_4h")
-                lf_orig1h = get_entry_level_feat(origin, is_bull, atr_v,  levels,    i,    "origin_1h")
-                lf_orig4h = get_entry_level_feat(origin, is_bull, atr_4h, levels_4h, i_4h, "origin_4h")
+            lf1h      = get_entry_level_feat(entry,  is_bull, atr_v,  levels,    i,    "entry_1h")
+            lf4h      = get_entry_level_feat(entry,  is_bull, atr_4h, levels_4h, i_4h, "entry_4h")
+            lf_orig1h = get_entry_level_feat(origin, is_bull, atr_v,  levels,    i,    "origin_1h")
+            lf_orig4h = get_entry_level_feat(origin, is_bull, atr_4h, levels_4h, i_4h, "origin_4h")
             # origin_* don't have an _at_level flag in NUM_FEATURES — drop it
             lf_orig1h = {k: v for k, v in lf_orig1h.items() if k != "origin_1h_at_level"}
             lf_orig4h = {k: v for k, v in lf_orig4h.items() if k != "origin_4h_at_level"}
@@ -1291,12 +1281,7 @@ def scan_symbol(
             (direction == "Long"  and htf_now == "Bullish") or
             (direction == "Short" and htf_now == "Bearish")
         )
-        _sc = _startup_cache.get(symbol)
-        if _sc:
-            _ci = _cache_bar(ts, _sc["ts_1h"])
-            conf = get_confluence(_ci, float(df1h["close"].iloc[i_cur]), s.is_bull, _sc["levels_1h"], atr_now)
-        else:
-            conf = get_confluence(i_cur, float(df1h["close"].iloc[i_cur]), s.is_bull, levels, atr_now)
+        conf = get_confluence(i_cur, float(df1h["close"].iloc[i_cur]), s.is_bull, levels, atr_now)
         risk = abs(s.entry - s.stop)
         vr   = float(df1h["vol_ratio"].iloc[i_cur])
 
@@ -1453,8 +1438,6 @@ def main():
         clf.load_model(model_path)
         clfs[sym] = clf
         print(f"Model loaded  : {model_path}  ({sym})")
-
-    precompute_startup_levels()   # ~2-3 min — builds full Highlander level cache
 
     print(f"Monitoring    : {', '.join(SYMBOLS.keys())} 1H on {EXCHANGE_ID}")
     print(f"Signal filter : P >= {P_THRESHOLD}")
